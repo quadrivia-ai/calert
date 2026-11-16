@@ -384,14 +384,42 @@ func (m *GoogleChatManager) ID() string {
 }
 
 // chatResponseBodyLimit caps how much of Google Chat's response is reported.
-// Google's error JSON names the cause — a quota that is exhausted reads
-// differently from an argument it rejected — well inside this, and the cap
-// stops one rejected dispatch from filling a log line.
+// Google's error JSON names the cause well inside this, and the cap stops one
+// rejected dispatch from filling a log line.
 const chatResponseBodyLimit = 512
 
+// chatBodyWithheld replaces the body on the statuses whose body is not logged.
+// Without it a 400 line would simply lack a body and read as "Google returned
+// nothing", which is a different and wrong conclusion.
+const chatBodyWithheld = "4xx: can quote the request"
+
+// bodyIsSafeToLog decides whether Google's response body may be logged for this
+// status. Only 429 and 5xx qualify.
+//
+// WHY THE LINE IS HERE. 429 and 5xx are where the diagnostic value is: the
+// 2026-10-28 incident was 502s, and Google's body is the only place that
+// separates an exhausted quota from a backend that is down. Those bodies are
+// about Google's own state, not about our request.
+//
+// A 4xx is the opposite. Google rejects a request it has read, and an
+// INVALID_ARGUMENT body can name the field it would not accept — so a 4xx body
+// is the one class that can quote back part of what we sent. The Chat card is
+// built from alert labels and annotations, and nothing in this estate screens
+// those for PHI, so a 4xx body is not ours to log.
+//
+// A 400 is still logged as a line. It carries the status, the room, the
+// provider, the attempt and the retry decision. Only the body is withheld.
+//
+// Diego decided this on 2026-11-16, narrowing TECH-581's original "Google's
+// response body is safe", which was too broad.
+func bodyIsSafeToLog(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
 // reportChatResponse records what Google Chat returned for one attempt: it logs
-// the status and Google's response body, and it stores the status on the
-// request's chatAttempt so the dispatch error counter can label it.
+// the status, it logs Google's response body for the statuses where that body
+// is safe (see bodyIsSafeToLog), and it stores the status on the request's
+// chatAttempt so the dispatch error counter can label it.
 //
 // It stays quiet on a 200. A delivered alert has no status to explain, and the
 // control for this is a successful dispatch whose log carries no status at all.
@@ -409,10 +437,12 @@ const chatResponseBodyLimit = 512
 //   - The request body and any alert label or annotation value are not logged.
 //     Nothing in this estate screens alert labels for PHI, and the Chat card is
 //     built from them.
+//   - A 4xx response body is not logged either, because Google can name a field
+//     we sent in it. See bodyIsSafeToLog.
 //
-// Google's own response is what is safe to report. The rule in one line: log
-// what Google said, never what we sent. The same rule, with the same reasoning,
-// is at livekit-agent-watchdog/main.py:352-366 in quadrivia-ai/devops.
+// The rule in one line: log what Google said about itself, never what we sent.
+// The same rule, with the same reasoning, is at
+// livekit-agent-watchdog/main.py:352-366 in quadrivia-ai/devops.
 func reportChatResponse(ctx context.Context, m *GoogleChatManager, resp *http.Response, shouldRetry bool, retryMax int) {
 	status := 0
 	if resp != nil {
@@ -447,14 +477,22 @@ func reportChatResponse(ctx context.Context, m *GoogleChatManager, resp *http.Re
 	if !willRetry {
 		level = slog.LevelError
 	}
-	m.lo.Log(ctx, level, "google chat did not accept the alert",
+	fields := []any{
 		"status", status,
 		"room", m.Room(),
 		"provider", m.ID(),
 		"attempt", attempt,
 		"will_retry", willRetry,
-		"response_body", readChatResponseBody(resp),
-	)
+	}
+	// response_body is reserved for text Google actually sent. Where the body
+	// is withheld it is reported under its own key, so nothing reading these
+	// logs can mistake the explanation for Google's own words.
+	if bodyIsSafeToLog(status) {
+		fields = append(fields, "response_body", readChatResponseBody(resp))
+	} else {
+		fields = append(fields, "body_withheld", chatBodyWithheld)
+	}
+	m.lo.Log(ctx, level, "google chat did not accept the alert", fields...)
 }
 
 // readChatResponseBody returns at most chatResponseBodyLimit bytes of Google's

@@ -89,14 +89,18 @@ func TestSendMessageSanitizesTransportAndResponseErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 401")
 	assert.NotContains(t, err.Error(), "sentinel")
-	// TECH-581 narrows this rule deliberately: Google's own response body IS
-	// reported now, because it is the one place Google says whether a rejection
-	// was an exhausted quota or an argument it would not accept, and the
-	// 2026-10-28 staging episode cost hours for want of exactly that. The rule
-	// is "log what Google said, never what we sent": the request URL, the
-	// request body and every alert label stay out, and so do the key and token
-	// the webhook carries in its query string.
-	assert.Contains(t, logs.String(), "response-body-sentinel")
+	// UNCHANGED FROM UPSTREAM, and it must stay that way. This is a 401, and
+	// TECH-581 does not log a 4xx response body: Google rejects a request it
+	// has read, so an INVALID_ARGUMENT body can name a field we sent, and the
+	// Chat card is built from alert labels that nothing in this estate screens
+	// for PHI. Only 429 and 5xx bodies are logged, which is where the
+	// diagnostic value is — the 2026-10-28 incident was 502s.
+	//
+	// The boundary this line sits on is tested from both sides in
+	// chat_status_report_test.go: TestFourxxResponseBodyIsNotLogged and
+	// TestRetryableResponseBodyIsLogged.
+	assert.NotContains(t, logs.String(), "response-body-sentinel")
+	// Additive: the credential must not appear in any form either.
 	assert.NotContains(t, logs.String(), "token-sentinel")
 	assert.NotContains(t, logs.String(), "key-sentinel")
 	assert.NotContains(t, logs.String(), "token=")

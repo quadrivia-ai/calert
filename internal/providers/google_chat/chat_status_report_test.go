@@ -7,6 +7,7 @@ package google_chat
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -182,4 +183,102 @@ func TestCheckRetryToleratesResponseWithoutBody(t *testing.T) {
 	shouldRetry, err := chat.client.CheckRetry(context.Background(), &http.Response{StatusCode: http.StatusBadGateway}, nil)
 	require.NoError(t, err)
 	assert.True(t, shouldRetry)
+}
+
+// bodySentinel is the stand-in for text Google put in a response body. It must
+// appear in the log for the statuses whose body is Google talking about itself,
+// and must never appear for the statuses where Google may be quoting us.
+const bodySentinel = "GOOGLE-RESPONSE-BODY-SENTINEL"
+
+// dispatchOneAttempt sends a single alert to a server that answers with status
+// and bodySentinel, and returns the whole log output. RetryMax is 0, so there
+// is exactly 1 attempt and exactly 1 report line.
+func dispatchOneAttempt(t *testing.T, status int) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"error":{"message":"` + bodySentinel + `"}}`))
+	}))
+	defer srv.Close()
+
+	chat, logs := chatWithLogBuffer(t, srv.URL+credentialQuery, 0)
+	err := chat.pushAlerts(context.Background(), []alertmgrtmpl.Alert{
+		{Status: "firing", Labels: alertmgrtmpl.KV{"alertname": "CriticalHTTP5xxErrorRate"}},
+	})
+	require.Error(t, err, "a non-2xx must fail the dispatch")
+	return logs.String()
+}
+
+// TestFourxxResponseBodyIsNotLogged is the half of the boundary that upstream's
+// TestSendMessageSanitizesTransportAndResponseErrors guarantees, kept as a
+// first-class test so the line is tested and not merely asserted in prose.
+//
+// Google rejects a 4xx request it has already read, so an INVALID_ARGUMENT body
+// can name a field we sent. The Chat card is built from alert labels, and
+// nothing in this estate screens those for PHI. The status must still be
+// visible; only the body is withheld.
+func TestFourxxResponseBodyIsNotLogged(t *testing.T) {
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			out := dispatchOneAttempt(t, status)
+
+			assert.NotContains(t, out, bodySentinel, "a 4xx body must never be logged")
+			assert.NotContains(t, out, `"response_body"`, "the response_body key is reserved for bodies we do log")
+
+			// The line itself must still be there, and still useful.
+			assert.Contains(t, out, fmt.Sprintf(`"status":%d`, status))
+			assert.Contains(t, out, `"room":"alerts-critical"`)
+			assert.Contains(t, out, `"provider":"google_chat"`)
+			assert.Contains(t, out, `"attempt":1`)
+			assert.Contains(t, out, `"will_retry":false`)
+			assert.Contains(t, out, `"body_withheld"`, "the line must say why there is no body")
+			assertNoCredential(t, out)
+		})
+	}
+}
+
+// TestRetryableResponseBodyIsLogged is the other half. 429 and 5xx are Google
+// describing its own state — an exhausted quota reads differently from a
+// backend that is down — and that difference is the fact the 2026-10-28
+// investigation lacked.
+func TestRetryableResponseBodyIsLogged(t *testing.T) {
+	for _, status := range []int{
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			out := dispatchOneAttempt(t, status)
+
+			assert.Contains(t, out, bodySentinel, "a 429 or 5xx body must be logged")
+			assert.Contains(t, out, `"response_body"`)
+			assert.NotContains(t, out, `"body_withheld"`)
+
+			assert.Contains(t, out, fmt.Sprintf(`"status":%d`, status))
+			assertNoCredential(t, out)
+		})
+	}
+}
+
+// TestBodyIsSafeToLogBoundary pins the predicate itself, including the statuses
+// either side of each edge, so a future edit cannot widen it by accident.
+func TestBodyIsSafeToLogBoundary(t *testing.T) {
+	for status, want := range map[int]bool{
+		200: false, 204: false,
+		400: false, 401: false, 403: false, 404: false, 413: false, 422: false,
+		428: false, 429: true, 430: false, 451: false,
+		499: false, 500: true, 502: true, 503: true, 504: true, 599: true,
+	} {
+		assert.Equalf(t, want, bodyIsSafeToLog(status), "bodyIsSafeToLog(%d)", status)
+	}
 }
