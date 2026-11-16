@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"unicode/utf8"
 
 	retryablehttp "github.com/hashicorp/go-retryablehttp"
@@ -101,7 +103,12 @@ func (m *GoogleChatManager) sendMessage(ctx context.Context, msg chatv1.Message,
 
 	hasCard := len(msg.CardsV2) > 0
 	m.lo.Debug("sending alert", "threaded", threaded, "has_cards_v2", hasCard, "payload_bytes", len(out))
-	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(out))
+	// The retry policy records each attempt's status here. retryablehttp hands
+	// CheckRetry the request's context (client.go:725), and it returns a nil
+	// response once it gives up (client.go:830-832), so this is the only way
+	// the status of a retried failure survives to the error below.
+	attempt := &chatAttempt{}
+	req, err := retryablehttp.NewRequestWithContext(withChatAttempt(ctx, attempt), http.MethodPost, u.String(), bytes.NewReader(out))
 	if err != nil {
 		return fmt.Errorf("building Google Chat request")
 	}
@@ -111,12 +118,44 @@ func (m *GoogleChatManager) sendMessage(ctx context.Context, msg chatv1.Message,
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		return fmt.Errorf("sending Google Chat request")
+		// Text unchanged: retryablehttp's own error names the full request URL,
+		// so it is still neither wrapped nor logged. Only the status travels.
+		return &chatSendError{msg: "sending Google Chat request", status: attempt.status}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("google chat returned status %d", resp.StatusCode)
+		return &chatSendError{
+			msg:    fmt.Sprintf("google chat returned status %d", resp.StatusCode),
+			status: resp.StatusCode,
+		}
 	}
 	return nil
+}
+
+// chatSendError carries the HTTP status Google Chat returned alongside the
+// error, so the dispatch error counter can label it. The error text is
+// unchanged and still says nothing about the request.
+type chatSendError struct {
+	msg    string
+	status int
+}
+
+func (e *chatSendError) Error() string { return e.msg }
+
+// Status returns the HTTP status Google Chat returned, or 0 when no response
+// ever arrived.
+func (e *chatSendError) Status() int { return e.status }
+
+// chatStatusLabel renders err's status for the `status` label on
+// calert_alerts_dispatched_errors_total. "none" means no response arrived at
+// all — a timeout or a connection error — which is a different fact from any
+// status Google returned. Cardinality is the handful of statuses Chat returns
+// times the configured rooms.
+func chatStatusLabel(err error) string {
+	var sendErr *chatSendError
+	if errors.As(err, &sendErr) && sendErr.status > 0 {
+		return strconv.Itoa(sendErr.status)
+	}
+	return "none"
 }

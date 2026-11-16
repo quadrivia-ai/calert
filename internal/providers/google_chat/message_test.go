@@ -89,6 +89,16 @@ func TestSendMessageSanitizesTransportAndResponseErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 401")
 	assert.NotContains(t, err.Error(), "sentinel")
-	assert.NotContains(t, logs.String(), "response-body-sentinel")
+	// TECH-581 narrows this rule deliberately: Google's own response body IS
+	// reported now, because it is the one place Google says whether a rejection
+	// was an exhausted quota or an argument it would not accept, and the
+	// 2026-10-28 staging episode cost hours for want of exactly that. The rule
+	// is "log what Google said, never what we sent": the request URL, the
+	// request body and every alert label stay out, and so do the key and token
+	// the webhook carries in its query string.
+	assert.Contains(t, logs.String(), "response-body-sentinel")
 	assert.NotContains(t, logs.String(), "token-sentinel")
+	assert.NotContains(t, logs.String(), "key-sentinel")
+	assert.NotContains(t, logs.String(), "token=")
+	assert.NotContains(t, logs.String(), "key=")
 }

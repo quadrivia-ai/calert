@@ -1,9 +1,11 @@
 package google_chat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -89,6 +91,12 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		transport.Proxy = http.ProxyURL(u)
 	}
 
+	// Declared here so the CheckRetry policy below can name the room and the
+	// provider it is reporting for. The closure captures the variable, not its
+	// value, and it only ever runs through mgr.client, which exists after mgr
+	// is assigned below.
+	var mgr *GoogleChatManager
+
 	// Initialise a retryable HTTP Client for communicating with the G-Chat APIs.
 	client := retryablehttp.NewClient()
 	client.RetryMax = opts.RetryMax
@@ -104,13 +112,21 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 	client.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
 		// First, check the default retry policy.
 		shouldRetry, checkErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-		if shouldRetry {
-			return true, checkErr
-		}
 
 		// Additionally retry on 429 Too Many Requests.
-		if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
-			return true, nil
+		if !shouldRetry && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			shouldRetry, checkErr = true, nil
+		}
+
+		// Report what Google Chat returned. This is the only place that can:
+		// once the retries are exhausted retryablehttp drains the response
+		// body and returns a nil response (go-retryablehttp client.go:830-832),
+		// so the status never reaches sendMessage and the one branch that does
+		// print a status (message.go) is unreachable for every retried status.
+		reportChatResponse(ctx, mgr, resp, shouldRetry, client.RetryMax)
+
+		if shouldRetry {
+			return true, checkErr
 		}
 
 		return false, nil
@@ -195,7 +211,7 @@ func NewGoogleChat(opts GoogleChatOpts) (*GoogleChatManager, error) {
 		return nil, err
 	}
 
-	mgr := &GoogleChatManager{
+	mgr = &GoogleChatManager{
 		lo:              opts.Log,
 		metrics:         opts.Metrics,
 		client:          client,
@@ -311,7 +327,7 @@ func (m *GoogleChatManager) pushGroup(ctx context.Context, payload providers.Web
 
 	for _, msg := range msgs {
 		if err := m.sendMessage(ctx, msg, threadKey, true); err != nil {
-			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
+			m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending", status="%s"}`, m.ID(), m.Room(), chatStatusLabel(err)))
 			return err
 		}
 	}
@@ -347,7 +363,7 @@ func (m *GoogleChatManager) pushAlerts(ctx context.Context, alerts []alertmgrtmp
 		threadKey := threadKeyForAlert(m.room, alert.Fingerprint, alert.StartsAt)
 		for _, msg := range msgs {
 			if err := m.sendMessage(ctx, msg, threadKey, m.threadedReplies); err != nil {
-				m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending"}`, m.ID(), m.Room()))
+				m.metrics.Increment(fmt.Sprintf(`alerts_dispatched_errors_total{provider="%s", room="%s", reason="sending", status="%s"}`, m.ID(), m.Room(), chatStatusLabel(err)))
 				return err
 			}
 		}
@@ -365,4 +381,134 @@ func (m *GoogleChatManager) Room() string {
 // ID returns the provider name.
 func (m *GoogleChatManager) ID() string {
 	return "google_chat"
+}
+
+// chatResponseBodyLimit caps how much of Google Chat's response is reported.
+// Google's error JSON names the cause — a quota that is exhausted reads
+// differently from an argument it rejected — well inside this, and the cap
+// stops one rejected dispatch from filling a log line.
+const chatResponseBodyLimit = 512
+
+// reportChatResponse records what Google Chat returned for one attempt: it logs
+// the status and Google's response body, and it stores the status on the
+// request's chatAttempt so the dispatch error counter can label it.
+//
+// It stays quiet on a 200. A delivered alert has no status to explain, and the
+// control for this is a successful dispatch whose log carries no status at all.
+//
+// What must never be logged, and why this function takes no URL, no request
+// body and no error value:
+//
+//   - The request URL is a credential. A Google Chat incoming webhook carries
+//     its key and its token as query parameters, and retryablehttp's redactURL
+//     (client.go:928-938) masks only the userinfo password, so even the
+//     "redacted" URL prints both. google_chat.go sets client.Logger to nil for
+//     exactly this reason; that line is a control, not an oversight.
+//   - The err that CheckRetry receives is a *url.Error, whose message is built
+//     from that same URL. So it is not logged either, not even its text.
+//   - The request body and any alert label or annotation value are not logged.
+//     Nothing in this estate screens alert labels for PHI, and the Chat card is
+//     built from them.
+//
+// Google's own response is what is safe to report. The rule in one line: log
+// what Google said, never what we sent. The same rule, with the same reasoning,
+// is at livekit-agent-watchdog/main.py:352-366 in quadrivia-ai/devops.
+func reportChatResponse(ctx context.Context, m *GoogleChatManager, resp *http.Response, shouldRetry bool, retryMax int) {
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+
+	attempt := 0
+	if a := chatAttemptFrom(ctx); a != nil {
+		a.count++
+		attempt = a.count
+		// Only a real response sets the status, so the last status Google
+		// returned survives a later attempt that never reached it at all.
+		if status != 0 {
+			a.status = status
+		}
+	}
+
+	// shouldRetry on its own is not whether a retry happens. retryablehttp
+	// calls CheckRetry before it checks the retry budget (client.go:755-764),
+	// so on the last attempt the policy still answers "retry" and then the loop
+	// gives up. Mirroring that budget check here is what makes the line that
+	// loses the alert say so.
+	willRetry := shouldRetry && attempt > 0 && attempt <= retryMax
+
+	if m == nil || m.lo == nil || status == http.StatusOK {
+		return
+	}
+
+	// An attempt that will be retried is a warning; the one that gives up is
+	// the error that loses the alert.
+	level := slog.LevelWarn
+	if !willRetry {
+		level = slog.LevelError
+	}
+	m.lo.Log(ctx, level, "google chat did not accept the alert",
+		"status", status,
+		"room", m.Room(),
+		"provider", m.ID(),
+		"attempt", attempt,
+		"will_retry", willRetry,
+		"response_body", readChatResponseBody(resp),
+	)
+}
+
+// readChatResponseBody returns at most chatResponseBodyLimit bytes of Google's
+// response and puts them back, so every later reader sees the body it would
+// have seen. The real Closer is kept rather than wrapped in io.NopCloser:
+// retryablehttp drains and closes this body between attempts
+// (client.go:766-769) and sendMessage closes it at the end, and a no-op Close
+// would leak the connection on every rejected dispatch.
+func readChatResponseBody(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	orig := resp.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, chatResponseBodyLimit))
+	if err != nil && len(buf) == 0 {
+		return ""
+	}
+	resp.Body = replayBody{
+		Reader: io.MultiReader(bytes.NewReader(buf), orig),
+		Closer: orig,
+	}
+	return string(buf)
+}
+
+// replayBody serves bytes already read from a response body again, while Close
+// still closes the real body.
+type replayBody struct {
+	io.Reader
+	io.Closer
+}
+
+// chatAttempt records what Google Chat returned across the retries of one
+// request. reportChatResponse fills it in and sendMessage reads it, because
+// retryablehttp returns a nil response once it gives up (client.go:830-832) and
+// the status would otherwise be lost at the point the error is counted.
+//
+// One value per request, reached through the request context. retryablehttp
+// drives every attempt of a request from the caller's goroutine, so the writes
+// here and the read in sendMessage never overlap.
+type chatAttempt struct {
+	count  int
+	status int
+}
+
+type chatAttemptKey struct{}
+
+// withChatAttempt attaches a per-request chatAttempt to ctx.
+func withChatAttempt(ctx context.Context, a *chatAttempt) context.Context {
+	return context.WithValue(ctx, chatAttemptKey{}, a)
+}
+
+// chatAttemptFrom returns the request's chatAttempt, or nil when the caller did
+// not attach one.
+func chatAttemptFrom(ctx context.Context) *chatAttempt {
+	a, _ := ctx.Value(chatAttemptKey{}).(*chatAttempt)
+	return a
 }
